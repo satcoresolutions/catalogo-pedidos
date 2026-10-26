@@ -4,7 +4,8 @@ import "server-only";
 import type { Catalog, OrderConfig, Product } from "../types";
 import { normalize, parsePrice } from "./format";
 
-const EXCEL_URL = process.env.GOOGLE_DRIVE_EXCEL_URL;
+const PRODUCTS_CSV_URL = process.env.GOOGLE_SHEETS_PRODUCTOS_CSV_URL;
+const CONFIG_CSV_URL = process.env.GOOGLE_SHEETS_CONFIGURACION_CSV_URL;
 
 const DEFAULT_CONFIG: OrderConfig = {
   negocio: "Haz tu pedido",
@@ -16,25 +17,117 @@ const DEFAULT_CONFIG: OrderConfig = {
   pedidoMinimo: 0,
 };
 
-type Row = unknown[];
+type Row = string[];
 
-interface ExcelSheet {
-  sheet: string;
-  data: Row[];
-}
+/**
+ * Convierte texto CSV en filas y columnas.
+ * Admite comas, saltos de línea y comillas escapadas
+ * dentro de los campos.
+ */
+function parseCSV(csv: string): Row[] {
+  const rows: Row[] = [];
+  let row: string[] = [];
+  let field = "";
+  let insideQuotes = false;
 
-function sheetByName(sheets: ExcelSheet[], name: string) {
-  return sheets.find((sheet) => normalize(sheet.sheet) === normalize(name));
+  const input = csv.replace(/^\uFEFF/, "");
+
+  for (let i = 0; i < input.length; i++) {
+    const char = input[i];
+    const next = input[i + 1];
+
+    if (char === '"') {
+      if (insideQuotes && next === '"') {
+        field += '"';
+        i++;
+      } else {
+        insideQuotes = !insideQuotes;
+      }
+    } else if (char === "," && !insideQuotes) {
+      row.push(field);
+      field = "";
+    } else if (
+      (char === "\n" || char === "\r") &&
+      !insideQuotes
+    ) {
+      if (char === "\r" && next === "\n") i++;
+
+      row.push(field);
+
+      if (row.some((value) => value.trim() !== "")) {
+        rows.push(row);
+      }
+
+      row = [];
+      field = "";
+    } else {
+      field += char;
+    }
+  }
+
+  if (field !== "" || row.length > 0) {
+    row.push(field);
+
+    if (row.some((value) => value.trim() !== "")) {
+      rows.push(row);
+    }
+  }
+
+  if (insideQuotes) {
+    throw new Error("El CSV contiene un campo con comillas sin cerrar.");
+  }
+
+  return rows;
 }
 
 function toText(value: unknown): string {
-  return value === null || value === undefined ? "" : String(value).trim();
+  return value === null || value === undefined
+    ? ""
+    : String(value).trim();
 }
 
-function parseConfig(data: Row[] | undefined): OrderConfig {
+async function fetchCSV(url: string | undefined, name: string): Promise<Row[]> {
+  if (!url) {
+    throw new Error(
+      `Falta configurar la variable de entorno para la hoja "${name}".`,
+    );
+  }
+
+  let response: Response;
+
+  try {
+    response = await fetch(url, { cache: "no-store" });
+  } catch {
+    throw new Error(`No se pudo conectar con la hoja "${name}".`);
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `No se pudo leer la hoja "${name}" (HTTP ${response.status}).`,
+    );
+  }
+
+  const contentType = response.headers.get("content-type") ?? "";
+
+  if (contentType.includes("text/html")) {
+    throw new Error(
+      `La URL de "${name}" devolvió HTML en lugar de CSV. Comprueba que la hoja esté publicada como CSV y que copiaste la URL correcta.`,
+    );
+  }
+
+  const csv = await response.text();
+
+  if (!csv.trim()) {
+    throw new Error(`La hoja "${name}" está vacía o no contiene datos.`);
+  }
+
+  return parseCSV(csv);
+}
+
+function parseConfig(data: Row[]): OrderConfig {
   const config = { ...DEFAULT_CONFIG };
 
-  for (const row of data ?? []) {
+  for (const row of data) {
     const key = normalize(row[0]);
     const value = toText(row[1]);
 
@@ -55,8 +148,8 @@ function parseConfig(data: Row[] | undefined): OrderConfig {
   return config;
 }
 
-function parseProducts(data: Row[] | undefined): Product[] {
-  if (!data || data.length < 2) return [];
+function parseProducts(data: Row[]): Product[] {
+  if (data.length < 2) return [];
 
   const headers = data[0].map(normalize);
   const col = (name: string) => headers.indexOf(name);
@@ -71,7 +164,9 @@ function parseProducts(data: Row[] | undefined): Product[] {
   };
 
   if (idx.nombre === -1) {
-    throw new Error('La hoja "Productos" necesita una columna llamada "Nombre".');
+    throw new Error(
+      'La hoja "Productos" necesita una columna llamada "Nombre".',
+    );
   }
 
   const get = (row: Row, index: number) =>
@@ -90,71 +185,25 @@ function parseProducts(data: Row[] | undefined): Product[] {
         descripcion: toText(get(row, idx.descripcion)),
         precio: parsePrice(get(row, idx.precio)),
         foto: toText(get(row, idx.foto)),
-        disponible: !["no", "0", "false", "agotado"].includes(disponible),
+        disponible: !["no", "0", "false", "agotado"].includes(
+          disponible,
+        ),
       };
     });
 }
 
 /**
- * Lee el Excel alojado en Google Drive.
- * El archivo debe estar disponible para descarga desde el servidor.
- * Hojas esperadas: "Productos" y "Configuracion".
+ * Lee los productos y la configuración desde dos hojas
+ * publicadas como CSV en Google Sheets.
  */
 export async function loadCatalog(): Promise<Catalog> {
-  if (!EXCEL_URL) {
-    throw new Error(
-      "Falta configurar GOOGLE_DRIVE_EXCEL_URL en las variables de entorno.",
-    );
-  }
-
-  let response: Response;
-
-  try {
-    response = await fetch(EXCEL_URL, {
-      cache: "no-store",
-    });
-  } catch {
-    throw new Error("No se pudo conectar con el archivo de Excel en Google Drive.");
-  }
-
-  if (!response.ok) {
-    throw new Error(
-      `No se pudo descargar el Excel de Google Drive (HTTP ${response.status}).`,
-    );
-  }
-
-  const contentType = response.headers.get("content-type") ?? "";
-
-  if (
-    contentType.includes("text/html") &&
-    !EXCEL_URL.includes("export=download")
-  ) {
-    throw new Error(
-      "Google Drive devolvió una página HTML en lugar del Excel. Verifica el enlace de descarga y los permisos del archivo.",
-    );
-  }
-
-  const { default: readExcelFile } = await import("read-excel-file/node");
-
-  let sheets: ExcelSheet[];
-
-  try {
-    const buffer = Buffer.from(await response.arrayBuffer());
-    sheets = (await readExcelFile(buffer)) as ExcelSheet[];
-  } catch {
-    throw new Error(
-      "No se pudo interpretar el archivo descargado. Comprueba que sea un Excel válido (.xlsx).",
-    );
-  }
-
-  const productsSheet = sheetByName(sheets, "Productos") ?? sheets[0];
-
-  if (!productsSheet) {
-    throw new Error('El Excel no contiene una hoja llamada "Productos".');
-  }
+  const [productsData, configData] = await Promise.all([
+    fetchCSV(PRODUCTS_CSV_URL, "Productos"),
+    fetchCSV(CONFIG_CSV_URL, "Configuracion"),
+  ]);
 
   return {
-    config: parseConfig(sheetByName(sheets, "Configuracion")?.data),
-    products: parseProducts(productsSheet.data),
+    config: parseConfig(configData),
+    products: parseProducts(productsData),
   };
 }
