@@ -1,6 +1,6 @@
 
 import type { ReactElement, SVGProps } from "react";
-import type { ContactIcon } from "@/config/site";
+import type { ContactIcon } from "../../config/site";
 
 type IconProps = SVGProps<SVGSVGElement>;
 

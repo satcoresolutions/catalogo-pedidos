@@ -1,4 +1,4 @@
-import type { ContactItem } from "@/config/site";
+import type { ContactItem } from "../../config/site";
 import { ContactIconView } from "./icons";
 
 export function FooterContactItem({ item }: { item: ContactItem }) {
